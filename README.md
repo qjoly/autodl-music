@@ -48,6 +48,8 @@ autodl-music -url "..." -interval 1h
 | `-passkey` | `passkey.json` | Path to the passkey credential file |
 | `-config` | `autodl-music.json` | Path to the persistent config file |
 
+`visitor_data` and `po_token` are not CLI flags — set them via the web UI settings panel or edit the config JSON directly.
+
 CLI flags override values stored in the config file. The config file is written by the web UI.
 
 Available SponsorBlock categories: `sponsor`, `intro`, `outro`, `selfpromo`, `interaction`, `music_offtopic`, `preview`, `filler`.

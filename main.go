@@ -156,11 +156,13 @@ var cfg struct {
 // ---- App config (persisted, editable via web UI) ----
 
 type AppConfig struct {
-	URL        string   `json:"url"`
-	Output     string   `json:"output"`
-	Categories []string `json:"categories"`
-	Cookies    string   `json:"cookies"`
-	Interval   string   `json:"interval"`
+	URL         string   `json:"url"`
+	Output      string   `json:"output"`
+	Categories  []string `json:"categories"`
+	Cookies     string   `json:"cookies"`
+	Interval    string   `json:"interval"`
+	VisitorData string   `json:"visitor_data"`
+	POToken     string   `json:"po_token"`
 }
 
 var (
@@ -717,6 +719,16 @@ td{padding:10px 12px;font-size:12px;vertical-align:middle}
           </div>
         </div>
       </div>
+      <div class="srow" style="margin-top:4px">
+        <div class="field">
+          <label>Visitor Data <span style="color:var(--dim);text-transform:none;letter-spacing:0;font-size:9px">— ytcfg.get('VISITOR_DATA') in browser console</span></label>
+          <input type="text" id="cfg-visitor-data" placeholder="Cgt4eGZ4eGZ4...">
+        </div>
+        <div class="field">
+          <label>PO Token <span style="color:var(--dim);text-transform:none;letter-spacing:0;font-size:9px">— see docs for extraction</span></label>
+          <input type="text" id="cfg-po-token" placeholder="MnRsaGZsa...">
+        </div>
+      </div>
       <div class="settings-actions">
         <button class="btn-cfg" onclick="saveConfig()">save</button>
         <button class="btn-cfg" id="start-btn" onclick="startRun()">&#9654; start</button>
@@ -884,6 +896,8 @@ async function loadConfig(){
     document.getElementById('cfg-categories').value=(c.categories||[]).join(',');
     document.getElementById('cfg-cookies').value=c.cookies||'';
     document.getElementById('cfg-interval').value=c.interval||'';
+    document.getElementById('cfg-visitor-data').value=c.visitor_data||'';
+    document.getElementById('cfg-po-token').value=c.po_token||'';
     if(!c.url)toggleSettings();
   }catch(e){}
 }
@@ -897,6 +911,8 @@ async function saveConfig(){
       categories:cats,
       cookies:document.getElementById('cfg-cookies').value.trim(),
       interval:document.getElementById('cfg-interval').value.trim(),
+      visitor_data:document.getElementById('cfg-visitor-data').value.trim(),
+      po_token:document.getElementById('cfg-po-token').value.trim(),
     })});
 }
 
@@ -1084,12 +1100,27 @@ func ytdlpArgs(base []string, cookiesFile string) []string {
 	return base
 }
 
+// ytdlpPOTokenArgs appends PO-token / visitor-data extractor args when configured.
+func ytdlpPOTokenArgs(args []string) []string {
+	c := getAppCfg()
+	var parts []string
+	if c.VisitorData != "" {
+		parts = append(parts, "visitor_data="+c.VisitorData)
+	}
+	if c.POToken != "" {
+		parts = append(parts, "po_token=web+"+c.POToken)
+	}
+	if len(parts) == 0 {
+		return args
+	}
+	return append(args, "--extractor-args", "youtube:"+strings.Join(parts, ";"))
+}
+
 func getPlaylistEntries(playlistURL, cookiesFile string) ([]PlaylistEntry, error) {
-	args := ytdlpArgs([]string{
+	args := ytdlpPOTokenArgs(ytdlpArgs([]string{
 		"--flat-playlist", "-j", "--no-warnings",
-		"--extractor-args", "youtube:player_client=ios,mweb",
 		playlistURL,
-	}, cookiesFile)
+	}, cookiesFile))
 	cmd := exec.Command("yt-dlp", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1114,7 +1145,7 @@ func getPlaylistEntries(playlistURL, cookiesFile string) ([]PlaylistEntry, error
 
 func downloadAudio(videoID, outputDir, cookiesFile string) (string, error) {
 	outputTemplate := filepath.Join(outputDir, "%(id)s.%(ext)s")
-	args := ytdlpArgs([]string{
+	args := ytdlpPOTokenArgs(ytdlpArgs([]string{
 		"-x", "--audio-format", "mp3",
 		"--audio-quality", "0",
 		"--embed-metadata",
@@ -1124,7 +1155,7 @@ func downloadAudio(videoID, outputDir, cookiesFile string) (string, error) {
 		"--no-playlist",
 		"--no-warnings",
 		fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID),
-	}, cookiesFile)
+	}, cookiesFile))
 	cmd := exec.Command("yt-dlp", args...)
 	cmd.Stdout = &lineWriter{target: os.Stdout, level: "info"}
 	cmd.Stderr = &lineWriter{target: os.Stderr, level: "error"}
