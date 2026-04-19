@@ -7,7 +7,7 @@ COPY main.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o autodl-music .
 
 # Runtime stage
-FROM python:3.12-alpine
+FROM python:3.14-alpine
 RUN apk add --no-cache ffmpeg ca-certificates nodejs
 RUN pip install --no-cache-dir yt-dlp mutagen
 
