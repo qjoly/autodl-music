@@ -1,10 +1,23 @@
 # autodl-music
 
-Downloads a YouTube playlist as MP3 and removes sponsor segments, outros, and other junk using the [SponsorBlock](https://sponsor.ajay.app) API.
+Downloads a YouTube playlist as MP3, removes sponsor segments using [SponsorBlock](https://sponsor.ajay.app), and embeds metadata + cover art.
 
-**Dependencies:** `yt-dlp`, `ffmpeg` (or use the Docker image — batteries included).
+**Dependencies (bare-metal):** `yt-dlp`, `ffmpeg`, `node` or `deno` (for YouTube n-challenge). Or just use the Docker image — batteries included.
 
-## Usage
+---
+
+## Quick start
+
+### Web UI (recommended)
+
+```bash
+autodl-music -web
+# → open http://localhost:8080, register a passkey, configure and start
+```
+
+On first visit you will be prompted to **register a passkey**. After that, the passkey is used to authenticate every subsequent visit.
+
+### CLI
 
 ```bash
 # Public playlist
@@ -13,96 +26,149 @@ autodl-music -url "https://youtube.com/playlist?list=PLxxx"
 # Private playlist
 autodl-music -url "https://youtube.com/playlist?list=PLxxx" -cookies cookies.txt
 
-# Custom output directory and categories
-autodl-music -url "..." -output ~/Music -categories "sponsor,outro,intro"
+# Periodic sync every hour
+autodl-music -url "..." -interval 1h
 ```
 
-### All flags
+---
+
+## All flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-url` | *(required)* | YouTube playlist or video URL |
+| `-url` | *(none)* | YouTube playlist or video URL |
 | `-output` | `./music` | Output directory |
 | `-categories` | `sponsor,outro,selfpromo,interaction,music_offtopic` | SponsorBlock categories to cut |
-| `-cookies` | *(none)* | Path to a `cookies.txt` file (needed for private playlists) |
+| `-cookies` | *(none)* | Path to `cookies.txt` (needed for private playlists) |
+| `-interval` | *(none)* | Re-run interval, e.g. `1h`, `30m` |
+| `-web` | `false` | Enable web UI |
+| `-port` | `8080` | Web UI port |
+| `-host` | `localhost` | Hostname used for WebAuthn RPID — **must match the hostname you browse to** |
+| `-origin` | *(derived)* | Full WebAuthn origin, e.g. `https://mydomain.com` — overrides the default `http://<host>:<port>` |
+| `-passkey` | `passkey.json` | Path to the passkey credential file |
+| `-config` | `autodl-music.json` | Path to the persistent config file |
+
+CLI flags override values stored in the config file. The config file is written by the web UI.
 
 Available SponsorBlock categories: `sponsor`, `intro`, `outro`, `selfpromo`, `interaction`, `music_offtopic`, `preview`, `filler`.
 
 ---
 
+## Web UI — passkey troubleshooting
+
+The passkey implementation uses [WebAuthn](https://webauthn.io/). WebAuthn enforces that the **RP ID** (Relying Party ID) matches the **effective domain** of the origin your browser uses. If they don't match, you'll get:
+
+> `rp.id cannot be used with the current origin`
+
+### Accessing from localhost (default)
+
+No extra flags needed:
+
+```bash
+autodl-music -web
+# browse to http://localhost:8080
+```
+
+### Accessing from a LAN IP or hostname
+
+```bash
+autodl-music -web -host 192.168.1.10
+# browse to http://192.168.1.10:8080
+```
+
+> The `-host` value becomes the WebAuthn RPID. It must exactly match the hostname in your browser's address bar (IP addresses are valid).
+
+### Accessing behind a reverse proxy with HTTPS
+
+```bash
+autodl-music -web -host mydomain.com -origin https://mydomain.com
+# browse to https://mydomain.com  (proxy forwards to :8080)
+```
+
+The `-origin` flag sets the full origin that the browser will report during the WebAuthn ceremony. Use it whenever the origin your browser sees differs from `http://<host>:<port>`.
+
+### Re-registering a passkey
+
+Delete the passkey file and refresh the login page — you will be prompted to register again:
+
+```bash
+rm passkey.json   # or /config/passkey.json in Docker
+```
+
+---
+
 ## Private playlists — getting cookies.txt
 
-YouTube requires you to be logged in to access private or unlisted playlists.  
-`yt-dlp` accepts cookies exported from your browser in the [Netscape cookie format](http://www.cookieparser.com/netscape-cookies/).
+YouTube requires authentication for private or unlisted playlists. `yt-dlp` accepts cookies in [Netscape cookie format](http://www.cookieparser.com/netscape-cookies/).
 
 ### Option 1 — browser extension (recommended)
 
-1. Install one of these extensions while logged into YouTube:
+1. Install while logged into YouTube:
    - Chrome/Edge: [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
    - Firefox: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
 2. Navigate to `https://www.youtube.com`
-3. Click the extension icon → **Export** (scope: current site / `youtube.com`)
-4. Save the file as `cookies.txt`
+3. Click the extension → **Export** (scope: `youtube.com`)
+4. Save as `cookies.txt`
 
-### Option 2 — yt-dlp export from your browser (local only)
-
-If you have `yt-dlp` installed locally you can export cookies directly without an extension.  
-Replace `chrome` with `firefox`, `edge`, `safari`, or `brave` as needed.
+### Option 2 — yt-dlp export (local only)
 
 ```bash
 yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download \
   "https://www.youtube.com"
 ```
 
-This reads cookies straight from the browser's profile and writes `cookies.txt`.  
+Replace `chrome` with `firefox`, `edge`, `safari`, or `brave`.
+
 > **Note:** close the browser first on some platforms (Chrome locks the cookie DB while running).
-
-### Option 3 — browser DevTools (manual, no extension)
-
-1. Open `https://www.youtube.com` in your browser
-2. Press `F12` → **Application** tab → **Cookies** → `https://www.youtube.com`
-3. You need at minimum these cookies: `SID`, `HSID`, `SSID`, `LOGIN_INFO`, `SAPISID`, `__Secure-1PSID`, `__Secure-3PSID`
-4. Paste them into a file following the Netscape format:
-
-```
-# Netscape HTTP Cookie File
-.youtube.com	TRUE	/	FALSE	<expiry-unix>	<name>	<value>
-```
-
-> This is tedious — prefer option 1 or 2.
 
 ### Keeping cookies fresh
 
-YouTube session cookies expire. If downloads start failing with `Sign in to confirm you're not a bot` or `HTTP Error 403`, re-export your cookies and replace the file.
+YouTube session cookies expire. If downloads fail with `Sign in to confirm you're not a bot` or `HTTP Error 403`, re-export your cookies.
 
 ---
 
 ## Docker
 
+The image includes `yt-dlp`, `ffmpeg`, `mutagen`, and `node` (for n-challenge solving).
+
 ```bash
 docker build -t autodl-music .
-
-# Public playlist
-docker run --rm -v "$(pwd)/music:/music" autodl-music \
-  -url "https://youtube.com/playlist?list=PLxxx"
-
-# Private playlist — mount cookies.txt read-only
-docker run --rm \
-  -v "$(pwd)/music:/music" \
-  -v "$(pwd)/cookies.txt:/cookies.txt:ro" \
-  autodl-music \
-  -url "https://youtube.com/playlist?list=PLxxx" \
-  -cookies /cookies.txt
 ```
 
-> Inside the container, export `/cookies.txt` as read-only (`:ro`) so the file cannot be modified by the process.
+### Web UI mode (default ENTRYPOINT)
+
+Mount a `/config` directory for persistent state (config file, passkey):
+
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -v "$(pwd)/config:/config" \
+  -v "$(pwd)/music:/music" \
+  autodl-music
+```
+
+Then open `http://localhost:8080` and configure via the UI.
+
+To pass cookies for private playlists, place `cookies.txt` in the config directory and set the **Cookies file path** to `/config/cookies.txt` in the web UI settings.
+
+### CLI mode
+
+```bash
+docker run --rm \
+  -v "$(pwd)/music:/music" \
+  -v "$(pwd)/cookies.txt:/config/cookies.txt:ro" \
+  autodl-music \
+  -url "https://youtube.com/playlist?list=PLxxx" \
+  -cookies /config/cookies.txt
+```
 
 ---
 
 ## How it works
 
 1. `yt-dlp --flat-playlist` fetches all video IDs without downloading
-2. For each video, the SponsorBlock API is queried for segment timestamps
-3. `yt-dlp -x --audio-format mp3` downloads the audio
+2. For each video, the SponsorBlock API returns segment timestamps
+3. `yt-dlp -x --audio-format mp3 --embed-metadata --embed-thumbnail` downloads audio with cover art and tags
 4. `ffmpeg` uses `atrim` + `aconcat` to surgically remove the flagged intervals
-5. Already-downloaded files (`<videoID>.mp3`) are skipped on re-runs
+5. Already-downloaded files (`Title [videoID].mp3`) are skipped on re-runs
+6. Failed downloads appear in a table in the web UI — with **retry** and **remove** buttons

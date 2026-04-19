@@ -707,8 +707,14 @@ td{padding:10px 12px;font-size:12px;vertical-align:middle}
           <input type="text" id="cfg-categories" placeholder="sponsor,outro,selfpromo,...">
         </div>
         <div class="field">
-          <label>Cookies file path</label>
-          <input type="text" id="cfg-cookies" placeholder="/config/cookies.txt">
+          <label>Cookies file <span id="cookies-status" style="color:var(--dim);font-size:9px;letter-spacing:.08em;text-transform:none;margin-left:6px"></span></label>
+          <div style="display:flex;gap:6px">
+            <input type="text" id="cfg-cookies" placeholder="server path, or upload →" style="flex:1">
+            <label style="all:unset;border:1px solid var(--border);color:var(--muted);font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:6px 10px;cursor:pointer;white-space:nowrap;transition:all .2s" onmouseover="this.style.borderColor='var(--muted)';this.style.color='var(--text)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--muted)'">
+              upload
+              <input type="file" id="cookies-file" accept=".txt,text/plain" style="display:none" onchange="uploadCookies(this)">
+            </label>
+          </div>
         </div>
       </div>
       <div class="settings-actions">
@@ -903,6 +909,28 @@ function setRunning(running){
     badge.className='live';badge.innerHTML='&#9679; live';
     dot.classList.add('pulse');dot.style.background='var(--red)';
   }
+}
+
+async function uploadCookies(input){
+  const file=input.files[0];
+  if(!file)return;
+  const status=document.getElementById('cookies-status');
+  status.textContent='uploading…';
+  const fd=new FormData();
+  fd.append('cookies',file);
+  try{
+    const r=await fetch('/api/cookies',{method:'POST',body:fd});
+    if(!r.ok)throw new Error(await r.text());
+    const d=await r.json();
+    document.getElementById('cfg-cookies').value=d.path;
+    status.textContent='✓ uploaded';
+    status.style.color='#16a34a';
+    setTimeout(()=>{status.textContent='';status.style.color=''},3000);
+  }catch(e){
+    status.textContent='✗ '+e.message;
+    status.style.color='var(--red)';
+  }
+  input.value='';
 }
 
 async function startRun(){
@@ -1375,6 +1403,54 @@ func serveRunStatus(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"running": isRunning()})
 }
 
+func serveUploadCookies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Limit to 10 MB — cookies files are tiny, but be safe.
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, "parse error: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	file, _, err := r.FormFile("cookies")
+	if err != nil {
+		http.Error(w, "missing file field 'cookies'", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	c := getAppCfg()
+	dest := c.Cookies
+	if dest == "" {
+		// Default: next to the config file.
+		dest = filepath.Join(filepath.Dir(cfg.appCfgFile), "cookies.txt")
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		http.Error(w, "mkdir: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		http.Error(w, "create: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, file); err != nil {
+		http.Error(w, "write: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// If cookies path wasn't configured yet, persist the default path.
+	if c.Cookies == "" {
+		c.Cookies = dest
+		_ = setAppCfg(c)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"path": dest})
+}
+
 // ---- Entry point ----
 
 func main() {
@@ -1468,6 +1544,7 @@ func main() {
 		}))
 		mux.HandleFunc("/api/start", requireAuth(serveStart))
 		mux.HandleFunc("/api/status", requireAuth(serveRunStatus))
+		mux.HandleFunc("/api/cookies", requireAuth(serveUploadCookies))
 
 		fmt.Printf("Web UI: http://localhost:%d\n", *port)
 		go func() {
