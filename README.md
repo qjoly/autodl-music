@@ -48,8 +48,6 @@ autodl-music -url "..." -interval 1h
 | `-passkey` | `passkey.json` | Path to the passkey credential file |
 | `-config` | `autodl-music.json` | Path to the persistent config file |
 
-`visitor_data` and `po_token` are not CLI flags — set them via the web UI settings panel or edit the config JSON directly.
-
 CLI flags override values stored in the config file. The config file is written by the web UI.
 
 Available SponsorBlock categories: `sponsor`, `intro`, `outro`, `selfpromo`, `interaction`, `music_offtopic`, `preview`, `filler`.
@@ -112,7 +110,7 @@ YouTube requires authentication for private or unlisted playlists. `yt-dlp` acce
 3. Click the extension → **Export** (scope: `youtube.com`)
 4. Save as `cookies.txt`
 
-### Option 2 — yt-dlp export (local only)
+### Option 2 — yt-dlp export ⚠️ unreliable
 
 ```bash
 yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download \
@@ -121,11 +119,42 @@ yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download \
 
 Replace `chrome` with `firefox`, `edge`, `safari`, or `brave`.
 
-> **Note:** close the browser first on some platforms (Chrome locks the cookie DB while running).
+> **Warning:** Firefox (and sometimes Chrome) rotates session cookies when they are read from the browser profile on disk, producing immediately invalid cookies. Close the browser completely before running this command, and prefer Option 1 if it still fails.
 
 ### Keeping cookies fresh
 
 YouTube session cookies expire. If downloads fail with `Sign in to confirm you're not a bot` or `HTTP Error 403`, re-export your cookies.
+
+---
+
+## VPS / datacenter — bypassing YouTube bot checks
+
+YouTube applies stricter bot detection to datacenter IPs. The recommended solution is to **route yt-dlp traffic through a residential proxy** — a machine on a home or non-datacenter connection that YouTube trusts.
+
+The simplest option is an SSH SOCKS5 tunnel from your VPS to a home server or any non-datacenter machine where your YouTube account works.
+
+**One-time setup — SSH SOCKS5 tunnel:**
+
+On your VPS, open a persistent tunnel to your home machine (or any trusted proxy):
+
+```bash
+# On the VPS — forward port 1080 through SSH to your home machine
+ssh -N -D 0.0.0.0:1080 user@home-machine &
+```
+
+Or use autossh for a persistent tunnel:
+```bash
+autossh -N -D 0.0.0.0:1080 user@home-machine
+```
+
+Then in the web UI → **Settings** → **Proxy**:
+```
+socks5://127.0.0.1:1080
+```
+
+All yt-dlp requests (playlist fetching and downloads) will go through the proxy. YouTube sees the request as coming from your home IP and will accept the cookies.
+
+yt-dlp supports `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://`, and `socks5h://` proxy URLs.
 
 ---
 
