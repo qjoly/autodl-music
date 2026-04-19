@@ -156,13 +156,12 @@ var cfg struct {
 // ---- App config (persisted, editable via web UI) ----
 
 type AppConfig struct {
-	URL         string   `json:"url"`
-	Output      string   `json:"output"`
-	Categories  []string `json:"categories"`
-	Cookies     string   `json:"cookies"`
-	Interval    string   `json:"interval"`
-	VisitorData string   `json:"visitor_data"`
-	POToken     string   `json:"po_token"`
+	URL        string   `json:"url"`
+	Output     string   `json:"output"`
+	Categories []string `json:"categories"`
+	Cookies    string   `json:"cookies"`
+	Interval   string   `json:"interval"`
+	Proxy      string   `json:"proxy"`
 }
 
 var (
@@ -206,7 +205,7 @@ func loadAppCfgFile() {
 // ---- Run state ----
 
 var (
-	runMu    sync.Mutex
+	runMu     sync.Mutex
 	runActive bool
 )
 
@@ -551,7 +550,6 @@ func serveLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
-
 // ---- Logger ----
 
 var webMode bool
@@ -721,12 +719,8 @@ td{padding:10px 12px;font-size:12px;vertical-align:middle}
       </div>
       <div class="srow" style="margin-top:4px">
         <div class="field">
-          <label>Visitor Data <span style="color:var(--dim);text-transform:none;letter-spacing:0;font-size:9px">— ytcfg.get('VISITOR_DATA') in browser console</span></label>
-          <input type="text" id="cfg-visitor-data" placeholder="Cgt4eGZ4eGZ4...">
-        </div>
-        <div class="field">
-          <label>PO Token <span style="color:var(--dim);text-transform:none;letter-spacing:0;font-size:9px">— see docs for extraction</span></label>
-          <input type="text" id="cfg-po-token" placeholder="MnRsaGZsa...">
+          <label>Proxy <span style="color:var(--dim);text-transform:none;letter-spacing:0;font-size:9px">— route yt-dlp through a proxy (e.g. socks5://user:pass@host:1080)</span></label>
+          <input type="text" id="cfg-proxy" placeholder="socks5://127.0.0.1:1080">
         </div>
       </div>
       <div class="settings-actions">
@@ -896,8 +890,7 @@ async function loadConfig(){
     document.getElementById('cfg-categories').value=(c.categories||[]).join(',');
     document.getElementById('cfg-cookies').value=c.cookies||'';
     document.getElementById('cfg-interval').value=c.interval||'';
-    document.getElementById('cfg-visitor-data').value=c.visitor_data||'';
-    document.getElementById('cfg-po-token').value=c.po_token||'';
+    document.getElementById('cfg-proxy').value=c.proxy||'';
     if(!c.url)toggleSettings();
   }catch(e){}
 }
@@ -911,8 +904,7 @@ async function saveConfig(){
       categories:cats,
       cookies:document.getElementById('cfg-cookies').value.trim(),
       interval:document.getElementById('cfg-interval').value.trim(),
-      visitor_data:document.getElementById('cfg-visitor-data').value.trim(),
-      po_token:document.getElementById('cfg-po-token').value.trim(),
+      proxy:document.getElementById('cfg-proxy').value.trim(),
     })});
 }
 
@@ -1100,24 +1092,17 @@ func ytdlpArgs(base []string, cookiesFile string) []string {
 	return base
 }
 
-// ytdlpPOTokenArgs appends PO-token / visitor-data extractor args when configured.
-func ytdlpPOTokenArgs(args []string) []string {
+// ytdlpExtraArgs appends proxy args when configured.
+func ytdlpExtraArgs(args []string) []string {
 	c := getAppCfg()
-	var parts []string
-	if c.VisitorData != "" {
-		parts = append(parts, "visitor_data="+c.VisitorData)
+	if c.Proxy != "" {
+		args = append(args, "--proxy", c.Proxy)
 	}
-	if c.POToken != "" {
-		parts = append(parts, "po_token=web+"+c.POToken)
-	}
-	if len(parts) == 0 {
-		return args
-	}
-	return append(args, "--extractor-args", "youtube:"+strings.Join(parts, ";"))
+	return args
 }
 
 func getPlaylistEntries(playlistURL, cookiesFile string) ([]PlaylistEntry, error) {
-	args := ytdlpPOTokenArgs(ytdlpArgs([]string{
+	args := ytdlpExtraArgs(ytdlpArgs([]string{
 		"--flat-playlist", "-j", "--no-warnings",
 		playlistURL,
 	}, cookiesFile))
@@ -1145,7 +1130,7 @@ func getPlaylistEntries(playlistURL, cookiesFile string) ([]PlaylistEntry, error
 
 func downloadAudio(videoID, outputDir, cookiesFile string) (string, error) {
 	outputTemplate := filepath.Join(outputDir, "%(id)s.%(ext)s")
-	args := ytdlpPOTokenArgs(ytdlpArgs([]string{
+	args := ytdlpExtraArgs(ytdlpArgs([]string{
 		"-x", "--audio-format", "mp3",
 		"--audio-quality", "0",
 		"--embed-metadata",
