@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	gwa "github.com/go-webauthn/webauthn/webauthn"
 )
 
 // ---- Domain types ----
@@ -145,10 +149,404 @@ func getFailures() []FailedEntry {
 // ---- Global config (needed by retry handler) ----
 
 var cfg struct {
-	outputDir    string
-	cookiesFile  string
-	cats         []string
-	tmpDir string
+	passkeyFile string
+	appCfgFile  string
+}
+
+// ---- App config (persisted, editable via web UI) ----
+
+type AppConfig struct {
+	URL        string   `json:"url"`
+	Output     string   `json:"output"`
+	Categories []string `json:"categories"`
+	Cookies    string   `json:"cookies"`
+	Interval   string   `json:"interval"`
+}
+
+var (
+	appCfgMu sync.Mutex
+	appCfg   AppConfig
+)
+
+func getAppCfg() AppConfig {
+	appCfgMu.Lock()
+	defer appCfgMu.Unlock()
+	return appCfg
+}
+
+func setAppCfg(c AppConfig) error {
+	if err := os.MkdirAll(filepath.Dir(cfg.appCfgFile), 0o755); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(c, "", "  ")
+	if err := os.WriteFile(cfg.appCfgFile, data, 0o644); err != nil {
+		return err
+	}
+	appCfgMu.Lock()
+	appCfg = c
+	appCfgMu.Unlock()
+	return nil
+}
+
+func loadAppCfgFile() {
+	data, err := os.ReadFile(cfg.appCfgFile)
+	if err != nil {
+		return
+	}
+	var c AppConfig
+	if json.Unmarshal(data, &c) == nil {
+		appCfgMu.Lock()
+		appCfg = c
+		appCfgMu.Unlock()
+	}
+}
+
+// ---- Run state ----
+
+var (
+	runMu    sync.Mutex
+	runActive bool
+)
+
+func tryStartRun() bool {
+	runMu.Lock()
+	defer runMu.Unlock()
+	if runActive {
+		return false
+	}
+	runActive = true
+	return true
+}
+
+func endRun() {
+	runMu.Lock()
+	runActive = false
+	runMu.Unlock()
+	bc.sendNamed("run_done", struct{}{})
+}
+
+func isRunning() bool {
+	runMu.Lock()
+	defer runMu.Unlock()
+	return runActive
+}
+
+// ---- Passkey / WebAuthn auth ----
+
+var wa *gwa.WebAuthn
+
+// passkeyUser is the single owner account, persisted to disk.
+type passkeyUser struct {
+	ID          []byte           `json:"id"`
+	Name        string           `json:"name"`
+	Credentials []gwa.Credential `json:"credentials"`
+}
+
+func (u *passkeyUser) WebAuthnID() []byte                    { return u.ID }
+func (u *passkeyUser) WebAuthnName() string                  { return u.Name }
+func (u *passkeyUser) WebAuthnDisplayName() string           { return "autodl-music" }
+func (u *passkeyUser) WebAuthnCredentials() []gwa.Credential { return u.Credentials }
+
+func loadPasskeyUser() (*passkeyUser, error) {
+	data, err := os.ReadFile(cfg.passkeyFile)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var u passkeyUser
+	return &u, json.Unmarshal(data, &u)
+}
+
+func savePasskeyUser(u *passkeyUser) error {
+	data, _ := json.Marshal(u)
+	return os.WriteFile(cfg.passkeyFile, data, 0o600)
+}
+
+// auth sessions (HttpOnly cookie → expiry)
+var (
+	authSessionsMu sync.Mutex
+	authSessions   = map[string]time.Time{}
+)
+
+func newAuthToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	token := hex.EncodeToString(b)
+	authSessionsMu.Lock()
+	authSessions[token] = time.Now().Add(7 * 24 * time.Hour)
+	authSessionsMu.Unlock()
+	return token
+}
+
+func isAuthenticated(r *http.Request) bool {
+	c, err := r.Cookie("auth")
+	if err != nil {
+		return false
+	}
+	authSessionsMu.Lock()
+	exp, ok := authSessions[c.Value]
+	authSessionsMu.Unlock()
+	return ok && time.Now().Before(exp)
+}
+
+func requireAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !isAuthenticated(r) {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// WebAuthn challenge sessions (short-lived, between begin/finish)
+var (
+	waChallengeMu sync.Mutex
+	waChallenges  = map[string]*gwa.SessionData{}
+)
+
+func storeChallenge(data *gwa.SessionData) string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	id := hex.EncodeToString(b)
+	waChallengeMu.Lock()
+	waChallenges[id] = data
+	waChallengeMu.Unlock()
+	return id
+}
+
+func popChallenge(id string) (*gwa.SessionData, bool) {
+	waChallengeMu.Lock()
+	defer waChallengeMu.Unlock()
+	d, ok := waChallenges[id]
+	if ok {
+		delete(waChallenges, id)
+	}
+	return d, ok
+}
+
+func setAuthCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: "auth", Value: newAuthToken(), Path: "/",
+		HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		MaxAge: 7 * 24 * 3600,
+	})
+}
+
+// ---- Auth HTTP handlers ----
+
+const loginPage = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>autodl-music — sign in</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--red:#ff3c3c;--bg:#0a0a0a;--surface:#0d0d0d;--border:#1a1a1a;--muted:#2e2e2e;--text:#d8d8d8;--dim:#555}
+body{background:var(--bg);color:var(--text);font-family:'Courier New',monospace;min-height:100vh;display:flex;align-items:center;justify-content:center}
+body::before{content:'';position:fixed;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.035) 1px,transparent 1px);background-size:20px 20px;pointer-events:none;z-index:0}
+.card{position:relative;z-index:1;width:320px;padding:48px 40px;border:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;align-items:center;gap:28px}
+.logo{display:flex;align-items:center;gap:12px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--red)}
+h1{font-size:13px;letter-spacing:.32em;text-transform:uppercase;font-weight:400}
+.hint{font-size:11px;color:var(--dim);letter-spacing:.06em;text-align:center;line-height:1.7}
+.btn{width:100%;background:none;border:1px solid var(--muted);color:var(--text);font-family:inherit;font-size:11px;letter-spacing:.18em;text-transform:uppercase;padding:11px 0;cursor:pointer;transition:border-color .2s,color .2s}
+.btn:hover:not(:disabled){border-color:var(--red);color:var(--red)}
+.btn:disabled{opacity:.35;cursor:default}
+.err{font-size:11px;color:var(--red);text-align:center;letter-spacing:.05em;min-height:14px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo"><div class="dot"></div><h1>autodl&#x2011;music</h1></div>
+  <p class="hint" id="hint">checking&hellip;</p>
+  <button class="btn" id="btn" disabled onclick="auth()"></button>
+  <p class="err" id="err"></p>
+</div>
+<script>
+let registered=false;
+const b64url=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+const b64dec=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s),c=>c.charCodeAt(0)).buffer};
+
+async function init(){
+  const d=await(await fetch('/auth/status')).json();
+  registered=d.registered;
+  document.getElementById('hint').textContent=registered?'Use your passkey to sign in':'No passkey registered yet';
+  const btn=document.getElementById('btn');
+  btn.textContent=registered?'sign in with passkey':'register passkey';
+  btn.disabled=false;
+}
+
+async function auth(){
+  const btn=document.getElementById('btn'),err=document.getElementById('err');
+  btn.disabled=true;err.textContent='';
+  try{registered?await login():await register();}
+  catch(e){err.textContent=e.message||'error';btn.disabled=false;}
+}
+
+async function register(){
+  const opts=await(await fetch('/auth/register/begin',{method:'POST'})).json();
+  opts.publicKey.challenge=b64dec(opts.publicKey.challenge);
+  opts.publicKey.user.id=b64dec(opts.publicKey.user.id);
+  const cred=await navigator.credentials.create(opts);
+  const res=await fetch('/auth/register/finish',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:cred.id,rawId:b64url(cred.rawId),type:cred.type,
+      response:{attestationObject:b64url(cred.response.attestationObject),
+                clientDataJSON:b64url(cred.response.clientDataJSON)}})});
+  if(!res.ok)throw new Error(await res.text());
+  location.href='/';
+}
+
+async function login(){
+  const opts=await(await fetch('/auth/login/begin',{method:'POST'})).json();
+  opts.publicKey.challenge=b64dec(opts.publicKey.challenge);
+  (opts.publicKey.allowCredentials||[]).forEach(c=>c.id=b64dec(c.id));
+  const a=await navigator.credentials.get(opts);
+  const res=await fetch('/auth/login/finish',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:a.id,rawId:b64url(a.rawId),type:a.type,
+      response:{authenticatorData:b64url(a.response.authenticatorData),
+                clientDataJSON:b64url(a.response.clientDataJSON),
+                signature:b64url(a.response.signature),
+                userHandle:a.response.userHandle?b64url(a.response.userHandle):null}})});
+  if(!res.ok)throw new Error(await res.text());
+  location.href='/';
+}
+
+init();
+</script>
+</body>
+</html>`
+
+func serveLogin(w http.ResponseWriter, r *http.Request) {
+	if isAuthenticated(r) {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(loginPage))
+}
+
+func serveAuthStatus(w http.ResponseWriter, _ *http.Request) {
+	u, _ := loadPasskeyUser()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"registered": u != nil && len(u.Credentials) > 0})
+}
+
+func serveRegisterBegin(w http.ResponseWriter, _ *http.Request) {
+	u, _ := loadPasskeyUser()
+	if u == nil {
+		id := make([]byte, 16)
+		_, _ = rand.Read(id)
+		u = &passkeyUser{ID: id, Name: "owner"}
+		_ = savePasskeyUser(u)
+	}
+	options, sessionData, err := wa.BeginRegistration(u)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: "wa_reg", Value: storeChallenge(sessionData), Path: "/",
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 300,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(options)
+}
+
+func serveRegisterFinish(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("wa_reg")
+	if err != nil {
+		http.Error(w, "missing challenge cookie", http.StatusBadRequest)
+		return
+	}
+	sessionData, ok := popChallenge(cookie.Value)
+	if !ok {
+		http.Error(w, "expired challenge", http.StatusBadRequest)
+		return
+	}
+	u, _ := loadPasskeyUser()
+	if u == nil {
+		http.Error(w, "user not initialised", http.StatusBadRequest)
+		return
+	}
+	cred, err := wa.FinishRegistration(u, *sessionData, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	u.Credentials = append(u.Credentials, *cred)
+	if err := savePasskeyUser(u); err != nil {
+		http.Error(w, "failed to save credential", http.StatusInternalServerError)
+		return
+	}
+	setAuthCookie(w)
+	w.WriteHeader(http.StatusOK)
+}
+
+func serveLoginBegin(w http.ResponseWriter, _ *http.Request) {
+	u, err := loadPasskeyUser()
+	if err != nil || u == nil || len(u.Credentials) == 0 {
+		http.Error(w, "not registered", http.StatusBadRequest)
+		return
+	}
+	options, sessionData, err := wa.BeginLogin(u)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: "wa_auth", Value: storeChallenge(sessionData), Path: "/",
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 300,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(options)
+}
+
+func serveLoginFinish(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("wa_auth")
+	if err != nil {
+		http.Error(w, "missing challenge cookie", http.StatusBadRequest)
+		return
+	}
+	sessionData, ok := popChallenge(cookie.Value)
+	if !ok {
+		http.Error(w, "expired challenge", http.StatusBadRequest)
+		return
+	}
+	u, err := loadPasskeyUser()
+	if err != nil || u == nil {
+		http.Error(w, "not registered", http.StatusBadRequest)
+		return
+	}
+	cred, err := wa.FinishLogin(u, *sessionData, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	for i, c := range u.Credentials {
+		if bytes.Equal(c.ID, cred.ID) {
+			u.Credentials[i].Authenticator.SignCount = cred.Authenticator.SignCount
+			break
+		}
+	}
+	_ = savePasskeyUser(u)
+	setAuthCookie(w)
+	w.WriteHeader(http.StatusOK)
+}
+
+func serveLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("auth"); err == nil {
+		authSessionsMu.Lock()
+		delete(authSessions, c.Value)
+		authSessionsMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "auth", Value: "", Path: "/", MaxAge: -1})
+	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
 
@@ -251,6 +649,27 @@ td{padding:10px 12px;font-size:12px;vertical-align:middle}
 .btn.remove:hover{border-color:var(--muted);color:var(--dim)}
 .btn:disabled{opacity:.35;cursor:default;pointer-events:none}
 ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--muted)}
+/* settings panel */
+#settings{border:1px solid var(--border);margin-bottom:24px}
+.settings-hd{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;cursor:pointer;user-select:none}
+.settings-hd:hover .settings-label{color:var(--text)}
+.settings-label{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted);transition:color .2s}
+.settings-arrow{font-size:10px;color:var(--muted);transition:transform .2s}
+.settings-arrow.open{transform:rotate(180deg)}
+.settings-body{border-top:1px solid var(--border);padding:16px;display:none}
+.settings-body.open{display:block}
+.srow{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.srow.full{grid-template-columns:1fr}
+.field label{display:block;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
+.field input{width:100%;background:none;border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:12px;padding:6px 10px;outline:none;transition:border-color .2s}
+.field input:focus{border-color:var(--muted)}
+.settings-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.btn-cfg{background:none;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:10px;letter-spacing:.14em;text-transform:uppercase;padding:5px 14px;cursor:pointer;transition:all .2s}
+.btn-cfg:hover{border-color:var(--muted);color:var(--text)}
+#start-btn{border-color:var(--red);color:var(--red)}
+#start-btn:hover:not(:disabled){background:var(--red);color:#000}
+#start-btn:disabled{opacity:.35;cursor:default;pointer-events:none}
+#start-btn.running{border-color:var(--muted);color:var(--muted);background:none}
 </style>
 </head>
 <body>
@@ -260,7 +679,44 @@ td{padding:10px 12px;font-size:12px;vertical-align:middle}
     <h1>autodl&#x2011;music</h1>
     <div id="badge" class="live">&#9679; live</div>
     <button id="theme-btn" onclick="toggleTheme()">light</button>
+    <a href="/logout" style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);text-decoration:none;padding:3px 0" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">logout</a>
   </header>
+  <section id="settings">
+    <div class="settings-hd" onclick="toggleSettings()">
+      <span class="settings-label">configuration</span>
+      <span class="settings-arrow" id="settings-arrow">▼</span>
+    </div>
+    <div class="settings-body" id="settings-body">
+      <div class="srow full"><div class="field">
+        <label>Playlist URL</label>
+        <input type="text" id="cfg-url" placeholder="https://youtube.com/playlist?list=...">
+      </div></div>
+      <div class="srow">
+        <div class="field">
+          <label>Output directory</label>
+          <input type="text" id="cfg-output" placeholder="./music">
+        </div>
+        <div class="field">
+          <label>Interval (e.g. 1h, 30m)</label>
+          <input type="text" id="cfg-interval" placeholder="disabled">
+        </div>
+      </div>
+      <div class="srow">
+        <div class="field">
+          <label>SponsorBlock categories</label>
+          <input type="text" id="cfg-categories" placeholder="sponsor,outro,selfpromo,...">
+        </div>
+        <div class="field">
+          <label>Cookies file path</label>
+          <input type="text" id="cfg-cookies" placeholder="/config/cookies.txt">
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button class="btn-cfg" onclick="saveConfig()">save</button>
+        <button class="btn-cfg" id="start-btn" onclick="startRun()">&#9654; start</button>
+      </div>
+    </div>
+  </section>
   <div class="terminal" id="logs"><div class="empty">waiting for output&hellip;</div></div>
   <footer>
     <span>yt-dlp &bull; sponsorblock &bull; ffmpeg</span>
@@ -400,6 +856,66 @@ es.onerror=()=>{
   badge.className='off';badge.textContent='✗ offline';
   dot.classList.remove('pulse');dot.style.background='#2e2e2e';
 };
+es.addEventListener('run_done',()=>{
+  setRunning(false);
+  badge.className='done';badge.textContent='✓ done';
+  dot.classList.remove('pulse');dot.style.background='#4ade80';
+});
+
+// ---- settings panel ----
+let settingsOpen=false;
+function toggleSettings(){
+  settingsOpen=!settingsOpen;
+  document.getElementById('settings-body').classList.toggle('open',settingsOpen);
+  document.getElementById('settings-arrow').classList.toggle('open',settingsOpen);
+}
+
+async function loadConfig(){
+  try{
+    const c=await(await fetch('/api/config')).json();
+    document.getElementById('cfg-url').value=c.url||'';
+    document.getElementById('cfg-output').value=c.output||'';
+    document.getElementById('cfg-categories').value=(c.categories||[]).join(',');
+    document.getElementById('cfg-cookies').value=c.cookies||'';
+    document.getElementById('cfg-interval').value=c.interval||'';
+    if(!c.url)toggleSettings();
+  }catch(e){}
+}
+
+async function saveConfig(){
+  const cats=document.getElementById('cfg-categories').value.split(',').map(s=>s.trim()).filter(Boolean);
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      url:document.getElementById('cfg-url').value.trim(),
+      output:document.getElementById('cfg-output').value.trim()||'./music',
+      categories:cats,
+      cookies:document.getElementById('cfg-cookies').value.trim(),
+      interval:document.getElementById('cfg-interval').value.trim(),
+    })});
+}
+
+function setRunning(running){
+  const btn=document.getElementById('start-btn');
+  btn.disabled=running;
+  btn.classList.toggle('running',running);
+  btn.innerHTML=running?'&#9679; running':'&#9654; start';
+  if(running){
+    badge.className='live';badge.innerHTML='&#9679; live';
+    dot.classList.add('pulse');dot.style.background='var(--red)';
+  }
+}
+
+async function startRun(){
+  await saveConfig();
+  const r=await fetch('/api/start',{method:'POST'});
+  if(r.status===409){append('Already running','error');return;}
+  if(!r.ok){append('Failed to start: '+(await r.text()),'error');return;}
+  setRunning(true);
+}
+
+// init
+loadConfig();
+fetch('/api/status').then(r=>r.json()).then(d=>{if(d.running)setRunning(true)}).catch(()=>{});
 </script>
 </body>
 </html>`
@@ -476,13 +992,14 @@ func serveRetry(w http.ResponseWriter, r *http.Request) {
 		logInfo("\n[retry] %s (%s)\n", entry.Title, entry.ID)
 		bc.sendNamed("retry_start", map[string]string{"id": entry.ID})
 
-		retryTmp := filepath.Join(cfg.tmpDir, "retry_"+entry.ID)
+		c := getAppCfg()
+		retryTmp := filepath.Join(c.Output, ".tmp", "retry_"+entry.ID)
 		_ = os.MkdirAll(retryTmp, 0o755)
 		defer os.RemoveAll(retryTmp)
 
 		err := processVideo(
 			PlaylistEntry{ID: entry.ID, Title: entry.Title},
-			cfg.outputDir, retryTmp, cfg.cookiesFile, cfg.cats,
+			c.Output, retryTmp, c.Cookies, c.Categories,
 		)
 		if err != nil {
 			logError("  Retry failed: %v\n", err)
@@ -776,15 +1293,31 @@ func processVideo(entry PlaylistEntry, outputDir, tmpDir, cookiesFile string, ca
 	return nil
 }
 
-func run(playlistURL string) {
-	if err := os.MkdirAll(cfg.tmpDir, 0o755); err != nil {
+func run() {
+	if !tryStartRun() {
+		logInfo("A run is already in progress.\n")
+		return
+	}
+	defer endRun()
+
+	c := getAppCfg()
+	if c.URL == "" {
+		logError("No playlist URL configured. Set it in the Settings panel.\n")
+		return
+	}
+	if c.Output == "" {
+		c.Output = "./music"
+	}
+
+	tmpDir := filepath.Join(c.Output, ".tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		logError("Failed to create tmp dir: %v\n", err)
 		return
 	}
-	defer os.RemoveAll(cfg.tmpDir)
+	defer os.RemoveAll(tmpDir)
 
 	logInfo("Fetching playlist entries...\n")
-	entries, err := getPlaylistEntries(playlistURL, cfg.cookiesFile)
+	entries, err := getPlaylistEntries(c.URL, c.Cookies)
 	if err != nil {
 		logError("Failed to get playlist: %v\n", err)
 		return
@@ -795,7 +1328,7 @@ func run(playlistURL string) {
 	for i, entry := range entries {
 		logInfo("\n[%d/%d] %s (%s)\n", i+1, len(entries), entry.Title, entry.ID)
 
-		if err := processVideo(entry, cfg.outputDir, cfg.tmpDir, cfg.cookiesFile, cfg.cats); err != nil {
+		if err := processVideo(entry, c.Output, tmpDir, c.Cookies, c.Categories); err != nil {
 			logError("  Error: %v\n", err)
 			addFailure(FailedEntry{ID: entry.ID, Title: entry.Title})
 			failCount++
@@ -808,67 +1341,128 @@ func run(playlistURL string) {
 	}
 }
 
+// ---- App config / run API handlers ----
+
+func serveGetConfig(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(getAppCfg())
+}
+
+func serveSetConfig(w http.ResponseWriter, r *http.Request) {
+	var c AppConfig
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := setAppCfg(c); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func serveStart(w http.ResponseWriter, _ *http.Request) {
+	if isRunning() {
+		http.Error(w, "already running", http.StatusConflict)
+		return
+	}
+	go run()
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func serveRunStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"running": isRunning()})
+}
+
 // ---- Entry point ----
 
 func main() {
-	playlistURL := flag.String("url", "", "YouTube playlist or video URL")
-	outputDir := flag.String("output", "./music", "Output directory")
-	categories := flag.String("categories",
-		"sponsor,outro,selfpromo,interaction,music_offtopic",
-		"Comma-separated SponsorBlock categories to remove")
-	cookiesFile := flag.String("cookies", "", "Path to cookies.txt file (required for private playlists)")
-	web := flag.Bool("web", false, "Enable web UI for live log streaming")
-	port := flag.Int("port", 8080, "Port for the web UI (requires -web)")
-	intervalStr := flag.String("interval", "", "Re-run interval, e.g. 1h, 30m (keep syncing the playlist periodically)")
+	urlFlag := flag.String("url", "", "Playlist URL (can also be set via web UI)")
+	outputFlag := flag.String("output", "", "Output directory (overrides config file)")
+	categoriesFlag := flag.String("categories", "", "Comma-separated SponsorBlock categories (overrides config file)")
+	cookiesFlag := flag.String("cookies", "", "Cookies file path (overrides config file)")
+	intervalFlag := flag.String("interval", "", "Re-run interval, e.g. 1h, 30m (overrides config file)")
+	web := flag.Bool("web", false, "Start web UI")
+	port := flag.Int("port", 8080, "Web UI port")
+	host := flag.String("host", "localhost", "Hostname for WebAuthn RPID")
+	passkeyFileFlag := flag.String("passkey", "passkey.json", "Path to passkey credential file")
+	appCfgFileFlag := flag.String("config", "autodl-music.json", "Path to persistent app config file")
 	flag.Parse()
 
-	if *playlistURL == "" {
-		fmt.Fprintln(os.Stderr, "Usage: autodl-music -url <playlist-url> [-output <dir>] [-categories <cat1,cat2>] [-cookies <cookies.txt>] [-web] [-port <port>]")
-		fmt.Fprintln(os.Stderr, "\nAvailable categories: sponsor, intro, outro, selfpromo, interaction, music_offtopic, preview, filler")
-		fmt.Fprintln(os.Stderr, "\nFor private playlists, export cookies from your browser and pass them with -cookies.")
-		os.Exit(1)
-	}
+	cfg.passkeyFile = *passkeyFileFlag
+	cfg.appCfgFile = *appCfgFileFlag
 
-	if *cookiesFile != "" {
-		if _, err := os.Stat(*cookiesFile); err != nil {
-			fmt.Fprintf(os.Stderr, "Cookies file not found: %s\n", *cookiesFile)
-			os.Exit(1)
+	// Load persisted config, then apply any CLI overrides.
+	loadAppCfgFile()
+	c := getAppCfg()
+	if *urlFlag != "" {
+		c.URL = *urlFlag
+	}
+	if *outputFlag != "" {
+		c.Output = *outputFlag
+	}
+	if *categoriesFlag != "" {
+		cats := strings.Split(*categoriesFlag, ",")
+		for i, v := range cats {
+			cats[i] = strings.TrimSpace(v)
 		}
+		c.Categories = cats
 	}
-
-	cats := strings.Split(*categories, ",")
-	for i, c := range cats {
-		cats[i] = strings.TrimSpace(c)
+	if *cookiesFlag != "" {
+		c.Cookies = *cookiesFlag
 	}
-
-	if err := os.MkdirAll(*outputDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create output dir: %v\n", err)
-		os.Exit(1)
+	if *intervalFlag != "" {
+		c.Interval = *intervalFlag
 	}
-
-	cfg.outputDir = *outputDir
-	cfg.cookiesFile = *cookiesFile
-	cfg.cats = cats
-	cfg.tmpDir = filepath.Join(*outputDir, ".tmp")
-
-	var interval time.Duration
-	if *intervalStr != "" {
-		d, err := time.ParseDuration(*intervalStr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid interval %q: %v\n", *intervalStr, err)
-			os.Exit(1)
-		}
-		interval = d
+	if c.Output == "" {
+		c.Output = "./music"
 	}
+	if len(c.Categories) == 0 {
+		c.Categories = strings.Split("sponsor,outro,selfpromo,interaction,music_offtopic", ",")
+	}
+	appCfgMu.Lock()
+	appCfg = c
+	appCfgMu.Unlock()
 
 	if *web {
 		webMode = true
+
+		var err error
+		wa, err = gwa.New(&gwa.Config{
+			RPDisplayName: "autodl-music",
+			RPID:          *host,
+			RPOrigins:     []string{fmt.Sprintf("http://%s:%d", *host, *port)},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WebAuthn init error: %v\n", err)
+			os.Exit(1)
+		}
+
 		mux := http.NewServeMux()
-		mux.HandleFunc("/", serveHome)
-		mux.HandleFunc("/logs", serveLogs)
-		mux.HandleFunc("/failures", serveFailures)
-		mux.HandleFunc("/retry", serveRetry)
-		mux.HandleFunc("/remove", serveRemove)
+		// public auth routes
+		mux.HandleFunc("/login", serveLogin)
+		mux.HandleFunc("/logout", serveLogout)
+		mux.HandleFunc("/auth/status", serveAuthStatus)
+		mux.HandleFunc("/auth/register/begin", serveRegisterBegin)
+		mux.HandleFunc("/auth/register/finish", serveRegisterFinish)
+		mux.HandleFunc("/auth/login/begin", serveLoginBegin)
+		mux.HandleFunc("/auth/login/finish", serveLoginFinish)
+		// protected routes
+		mux.HandleFunc("/", requireAuth(serveHome))
+		mux.HandleFunc("/logs", requireAuth(serveLogs))
+		mux.HandleFunc("/failures", requireAuth(serveFailures))
+		mux.HandleFunc("/retry", requireAuth(serveRetry))
+		mux.HandleFunc("/remove", requireAuth(serveRemove))
+		mux.HandleFunc("/api/config", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				serveGetConfig(w, r)
+			} else {
+				serveSetConfig(w, r)
+			}
+		}))
+		mux.HandleFunc("/api/start", requireAuth(serveStart))
+		mux.HandleFunc("/api/status", requireAuth(serveRunStatus))
 
 		fmt.Printf("Web UI: http://localhost:%d\n", *port)
 		go func() {
@@ -877,27 +1471,39 @@ func main() {
 			}
 		}()
 
-		run(*playlistURL)
-		if interval > 0 {
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for range ticker.C {
-				logInfo("\nScheduled re-run (every %s)...\n", interval)
-				run(*playlistURL)
+		// Auto-start if URL already known, then keep scheduling.
+		go func() {
+			if getAppCfg().URL != "" {
+				run()
 			}
-		} else {
-			bc.finish()
-			select {} // keep server alive for retries
-		}
+			for {
+				time.Sleep(30 * time.Second)
+				cur := getAppCfg()
+				if cur.Interval == "" || isRunning() {
+					continue
+				}
+				d, err := time.ParseDuration(cur.Interval)
+				if err != nil {
+					continue
+				}
+				// Simple approach: run once per interval after the last check.
+				// A proper ticker would require tracking last-run time; keep it simple.
+				time.Sleep(d - 30*time.Second)
+				if !isRunning() {
+					logInfo("\nScheduled re-run (every %s)...\n", cur.Interval)
+					run()
+				}
+			}
+		}()
+
+		select {} // keep server alive
 	} else {
-		run(*playlistURL)
-		if interval > 0 {
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for range ticker.C {
-				logInfo("\nScheduled re-run (every %s)...\n", interval)
-				run(*playlistURL)
-			}
+		// CLI mode: require a URL.
+		if getAppCfg().URL == "" {
+			fmt.Fprintln(os.Stderr, "Usage: autodl-music -url <playlist-url> [options]")
+			fmt.Fprintln(os.Stderr, "       autodl-music -web  (configure via browser)")
+			os.Exit(1)
 		}
+		run()
 	}
 }

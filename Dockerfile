@@ -1,7 +1,7 @@
 # Build stage
 FROM golang:1.26-alpine AS builder
 WORKDIR /app
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY main.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o autodl-music .
@@ -13,9 +13,9 @@ RUN pip install --no-cache-dir yt-dlp mutagen
 
 COPY --from=builder /app/autodl-music /usr/local/bin/autodl-music
 
-# /music  — output directory
-# /cookies.txt — optional: mount your browser cookies file for private playlists
-VOLUME ["/music"]
+# /music  — downloaded MP3s
+# /config — persistent config: cookies.txt, passkey.json
+VOLUME ["/music", "/config"]
 WORKDIR /music
 
-ENTRYPOINT ["autodl-music", "-output", "/music"]
+ENTRYPOINT ["autodl-music", "-web", "-passkey", "/config/passkey.json", "-config", "/config/autodl-music.json", "-output", "/music"]
