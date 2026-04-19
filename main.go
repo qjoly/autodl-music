@@ -1386,6 +1386,7 @@ func main() {
 	web := flag.Bool("web", false, "Start web UI")
 	port := flag.Int("port", 8080, "Web UI port")
 	host := flag.String("host", "localhost", "Hostname for WebAuthn RPID")
+	origin := flag.String("origin", "", "WebAuthn origin (e.g. https://mydomain.com). Defaults to http://<host>:<port>")
 	passkeyFileFlag := flag.String("passkey", "passkey.json", "Path to passkey credential file")
 	appCfgFileFlag := flag.String("config", "autodl-music.json", "Path to persistent app config file")
 	flag.Parse()
@@ -1428,11 +1429,15 @@ func main() {
 	if *web {
 		webMode = true
 
+		rpOrigin := *origin
+		if rpOrigin == "" {
+			rpOrigin = fmt.Sprintf("http://%s:%d", *host, *port)
+		}
 		var err error
 		wa, err = gwa.New(&gwa.Config{
 			RPDisplayName: "autodl-music",
 			RPID:          *host,
-			RPOrigins:     []string{fmt.Sprintf("http://%s:%d", *host, *port)},
+			RPOrigins:     []string{rpOrigin},
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "WebAuthn init error: %v\n", err)
