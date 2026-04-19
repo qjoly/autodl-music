@@ -8,8 +8,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o autodl-music .
 
 # Runtime stage
 FROM python:3.12-alpine
-RUN apk add --no-cache ffmpeg ca-certificates
-RUN pip install --no-cache-dir yt-dlp
+RUN apk add --no-cache ffmpeg ca-certificates nodejs
+RUN pip install --no-cache-dir yt-dlp mutagen
 
 COPY --from=builder /app/autodl-music /usr/local/bin/autodl-music
 
