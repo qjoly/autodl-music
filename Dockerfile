@@ -7,7 +7,7 @@ COPY main.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o autodl-music .
 
 # Runtime stage
-FROM python:3.14-slim
+FROM python:3.15-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates nodejs curl unzip \
  && ARCH=$(uname -m) \
